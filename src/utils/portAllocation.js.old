@@ -1,0 +1,89 @@
+// /opt/zpack-api/src/utils/portAllocation.js
+import prisma from '../services/prisma.js';
+
+
+
+export class PortAllocationService {
+  static async allocatePortBlock(customerId, portCount = 3) {
+    return await prisma.$transaction(async (tx) => {
+      // Check customer exists and get current allocations
+      const customer = await tx.customer.findUnique({
+        where: { id: customerId },
+        include: { ports: true }
+      })
+      
+      if (!customer) throw new Error('Customer not found')
+      
+      // Return existing allocation if found
+      const existingAllocation = customer.ports[0]
+      if (existingAllocation) {
+        return {
+          customerId,
+          basePort: existingAllocation.basePort,
+          ports: Array.from({length: existingAllocation.count}, 
+            (_, i) => existingAllocation.basePort + i),
+          isExisting: true
+        }
+      }
+      
+      // Find available port range
+      const basePort = await this.findAvailablePortRange(tx, portCount)
+      
+      // Create new allocation
+      const allocation = await tx.portAllocation.create({
+        data: {
+          customerId,
+          basePort,
+          count: portCount
+        }
+      })
+      
+      return {
+        customerId,
+        basePort,
+        ports: Array.from({length: portCount}, (_, i) => basePort + i),
+        isExisting: false
+      }
+    })
+  }
+
+  static async findAvailablePortRange(tx, count) {
+    // Get all existing allocations sorted by basePort
+    const allocations = await tx.portAllocation.findMany({
+      orderBy: { basePort: 'asc' }
+    })
+    
+    let startPort = 50000 // Your port range start
+    
+    for (const allocation of allocations) {
+      // Check if there's a gap before this allocation
+      if (startPort + count <= allocation.basePort) {
+        return startPort
+      }
+      // Move past this allocation
+      startPort = allocation.basePort + allocation.count
+    }
+    
+    // No conflicts found, return next available
+    if (startPort > 60000) {
+      throw new Error('Port range exhausted')
+    }
+    
+    return startPort
+  }
+
+  static async getCustomerPorts(customerId) {
+    const allocation = await prisma.portAllocation.findFirst({
+      where: { customerId }
+    })
+    
+    if (!allocation) return null
+    
+    return {
+      customerId,
+      basePort: allocation.basePort,
+      ports: Array.from({length: allocation.count}, 
+        (_, i) => allocation.basePort + i)
+    }
+  }
+}

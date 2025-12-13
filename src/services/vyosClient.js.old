@@ -1,0 +1,82 @@
+// src/services/vyosClient.js
+import axios from 'axios';
+import https from 'node:https';
+import FormData from 'form-data';
+
+// ENV
+const BASE = (process.env.VYOS_API_URL || '').replace(/\/+$/, ''); // e.g. https://10.60.0.254:8443
+const KEY  = process.env.VYOS_API_KEY || '';
+const TIMEOUT = Number(process.env.VYOS_TIMEOUT_MS || 10000);
+const ALLOW_SELF = process.env.VYOS_ALLOW_SELF_SIGNED === '1';
+
+if (!BASE) throw new Error('VYOS_API_URL is required');
+if (!KEY)  throw new Error('VYOS_API_KEY is required');
+
+const httpsAgent = ALLOW_SELF ? new https.Agent({ rejectUnauthorized: false }) : undefined;
+
+// helper: POST multipart form (key + data)
+async function postForm(path, payload) {
+  const fd = new FormData();
+  fd.append('key', KEY);
+  fd.append('data', typeof payload === 'string' ? payload : JSON.stringify(payload));
+  const { data } = await axios.post(`${BASE}${path}`, fd, {
+    timeout: TIMEOUT,
+    httpsAgent,
+    headers: fd.getHeaders(),
+    transitional: { forcedJSONParsing: false },
+    maxBodyLength: Infinity,
+  });
+  return data;
+}
+
+export default {
+  /** Lightweight health — /info doesn’t require multipart */
+  async healthDiag() {
+    const out = { ok: false, url: `${BASE}/info`, note: null };
+    try {
+      const { data } = await axios.get(`${BASE}/info?key=${encodeURIComponent(KEY)}`, {
+        timeout: TIMEOUT, httpsAgent,
+      });
+      out.ok = !!data;
+      return out;
+    } catch (e) {
+      out.note = e?.response?.status ? `info ${e.response.status}` : (e?.message || 'info error');
+      return out;
+    }
+  },
+
+  /** Read config subtree, e.g. ['nat','destination','rule'] */
+  async retrieve(path = []) {
+    return postForm('/retrieve', { op: 'showConfig', path });
+  },
+
+  /** Create/Update DNAT: WAN:dstPort -> natIp:natPort */
+  async createPortForward({ wanIf = 'eth0', descr = '', proto = 'tcp', dstPort, natIp, natPort }) {
+    const ruleId = String(dstPort); // deterministic: use public port as rule id
+    const nodes = [
+      { path: ['nat','destination','rule',ruleId,'description'], value: descr },
+      { path: ['nat','destination','rule',ruleId,'inbound-interface'], value: wanIf },
+      { path: ['nat','destination','rule',ruleId,'destination','port'], value: String(dstPort) },
+      { path: ['nat','destination','rule',ruleId,'protocol'], value: proto },
+      { path: ['nat','destination','rule',ruleId,'translation','address'], value: natIp },
+      { path: ['nat','destination','rule',ruleId,'translation','port'], value: String(natPort ?? dstPort) },
+    ];
+    const raw = await postForm('/configure', { op: 'set', nodes, commit: true, save: true });
+    return { id: ruleId, raw };
+  },
+
+  /** Delete DNAT by id (or port) */
+  async deletePortForward(idOrPort) {
+    const ruleId = String(idOrPort);
+    return postForm('/configure', {
+      op: 'delete',
+      nodes: [{ path: ['nat','destination','rule',ruleId] }],
+      commit: true, save: true,
+    });
+  },
+
+  /** Symmetry with old client; VyOS commits in /configure */
+  async applyChanges() {
+    return { ok: true, note: 'VyOS commits done in /configure' };
+  },
+};

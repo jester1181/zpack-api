@@ -1,0 +1,148 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url               = env("DATABASE_URL")
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
+//////////////////////////////////////////////////////////
+// ENUMS
+//////////////////////////////////////////////////////////
+
+enum CType {
+  game
+  dev
+}
+
+enum PortStatus {
+  free
+  allocated
+}
+
+//////////////////////////////////////////////////////////
+// ACTIVE CONTAINERS (Agent-Driven v2)
+//////////////////////////////////////////////////////////
+
+model ContainerInstance {
+  vmid           Int       @id
+  customerId     String?
+  ctype          CType
+  hostname       String
+  ip             String?
+
+  // Ports allocated to this VMID (e.g. { "game": [50000], "rcon": [50001] })
+  allocatedPorts Json?
+
+  // Exact payload.json written into /opt/zlh-agent/config/payload.json
+  payload        Json
+
+  // Agent-reported state: idle | installing | running | crashed | error
+  agentState     String
+
+  // Last time we successfully talked to the agent (/status)
+  agentLastSeen  DateTime?
+
+  // Crash tracking
+  crashCount     Int        @default(0)
+  lastCrashAt    DateTime?
+
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  @@index([hostname])
+  @@index([customerId])
+}
+
+//////////////////////////////////////////////////////////
+// DELETED INSTANCES (AUDIT TRAIL)
+//////////////////////////////////////////////////////////
+
+model DeletedInstance {
+  id          Int       @id @default(autoincrement())
+  vmid        Int
+  customerId  String?
+  hostname    String
+  game        String?
+  variant     String?
+  ports       Json?
+  ip          String?
+  reason      String?
+  notes       String?
+  deletedAt   DateTime   @default(now())
+}
+
+//////////////////////////////////////////////////////////
+// PORT ALLOCATION POOL
+//////////////////////////////////////////////////////////
+
+model PortPool {
+  id          Int        @id @default(autoincrement())
+  port        Int
+  portType    String     // "game" | "dev" | custom
+  status      PortStatus @default(free)
+  allocatedTo Int?       // vmid
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  @@unique([port])
+  @@index([status, portType])
+}
+
+//////////////////////////////////////////////////////////
+// VMID COUNTERS
+//////////////////////////////////////////////////////////
+
+model VmidCounter {
+  key       String   @id    // "game" | "dev"
+  current   Int
+  updatedAt DateTime @updatedAt
+}
+
+//////////////////////////////////////////////////////////
+// SYSTEM & EDGE STATE
+//////////////////////////////////////////////////////////
+
+model SystemConfig {
+  key   String @id
+  value Json?
+}
+
+model EdgeState {
+  id        Int      @id @default(autoincrement())
+  vmid      Int
+  hostname  String
+  ip        String?
+  edgeIp    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model JobLog {
+  id        Int      @id @default(autoincrement())
+  vmid      Int?
+  jobType   String
+  state     String
+  message   String?
+  createdAt DateTime @default(now())
+}
+
+model AuditLog {
+  id        Int      @id @default(autoincrement())
+  action    String
+  actor     String?
+  payload   Json?
+  createdAt DateTime @default(now())
+}
+
+model Customer {
+  id        String   @id
+  email     String?
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

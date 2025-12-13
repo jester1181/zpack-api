@@ -1,0 +1,36 @@
+// src/utils/portPool.js
+import prisma from '../services/prisma.js';
+
+
+export const PortPool = {
+  async allocate({ customerId, vmid, count = 1, ip = null, protocol = 'tcp', purpose = 'game' }) {
+    return prisma.$transaction(async (tx) => {
+      const rows = await tx.portPool.findMany({
+        where: { status: 'free', protocol, ip },
+        orderBy: { port: 'asc' },
+        take: count
+      })
+      if (rows.length < count) throw new Error('Insufficient free ports')
+
+      const ids = rows.map(r => r.id)
+      const now = new Date()
+      await tx.portPool.updateMany({
+        where: { id: { in: ids } },
+        data: { status: 'allocated', customerId, vmid, purpose, allocatedAt: now, releasedAt: null }
+      })
+      return rows.map(r => r.port)
+    })
+  },
+
+  async releaseByVmid(vmid) {
+    await prisma.portPool.updateMany({
+      where: { vmid, status: 'allocated' },
+      data: { status: 'free', customerId: null, vmid: null, purpose: null, releasedAt: new Date() }
+    })
+  },
+
+  async getByVmid(vmid) {
+    const rows = await prisma.portPool.findMany({ where: { vmid, status: 'allocated' }, orderBy: { port: 'asc' } })
+    return rows.map(r => r.port)
+  }
+}

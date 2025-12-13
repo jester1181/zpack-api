@@ -1,0 +1,36 @@
+{
+  "name": "zpack-api",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/app.js",
+  "scripts": {
+    "dev": "nodemon src/app.js",
+    "start": "node src/app.js",
+    "worker": "node src/worker.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev -n api_only_init",
+    "migrate": "prisma migrate dev",
+    "seed": "prisma db seed"
+  },
+  "prisma": {
+    "seed": "node src/prisma/seed-all.js"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.13.0",
+    "argon2": "^0.43.1",
+    "axios": "^1.11.0",
+    "bullmq": "^5.56.9",
+    "compression": "^1.8.1",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "ioredis": "^5.7.0",
+    "node-fetch": "^3.3.2",
+    "ssh2": "^1.16.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10",
+    "prisma": "^6.13.0"
+  }
+}
