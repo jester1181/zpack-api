@@ -1,13 +1,18 @@
 // src/api/provisionAgent.js
 // FINAL AGENT-DRIVEN PROVISIONING PIPELINE
-// Supports: paper, vanilla, purpur, forge, fabric, neoforge + Steam creds passthrough
+// Supports: paper, vanilla, purpur, forge, fabric, neoforge + dev containers
+//
+// Phase 12-14-25:
+// - Orchestrator remains unified
+// - Game/Dev validation split
+// - Dev containers provision like game infra, diverge at runtime semantics
 
 import "dotenv/config";
 import fetch from "node-fetch";
 import crypto from "crypto";
 
 import prisma from "../services/prisma.js";
-import proxmox, {
+import {
   cloneContainer,
   configureContainer,
   startWithRetry,
@@ -24,6 +29,9 @@ import {
 
 import { enqueuePublishEdge } from "../queues/postProvision.js";
 
+import { normalizeGameRequest } from "./handlers/provisionGame.js";
+import { normalizeDevRequest } from "./handlers/provisionDev.js";
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const AGENT_TEMPLATE_VMID = Number(
@@ -37,7 +45,7 @@ const AGENT_PORT = Number(process.env.ZLH_AGENT_PORT || 18888);
 const AGENT_TOKEN = process.env.ZLH_AGENT_TOKEN || null;
 
 /* -------------------------------------------------------------
-   VERSION PARSER
+   VERSION PARSER (Minecraft only)
 ------------------------------------------------------------- */
 function parseMcVersion(ver) {
   if (!ver) return { major: 0, minor: 0, patch: 0 };
@@ -50,7 +58,7 @@ function parseMcVersion(ver) {
 }
 
 /* -------------------------------------------------------------
-   JAVA RUNTIME SELECTOR
+   JAVA RUNTIME SELECTOR (Minecraft only)
 ------------------------------------------------------------- */
 function pickJavaRuntimeForMc(version) {
   const { major, minor, patch } = parseMcVersion(version);
@@ -70,7 +78,9 @@ function pickJavaRuntimeForMc(version) {
 /* -------------------------------------------------------------
    HOSTNAME GENERATION
 ------------------------------------------------------------- */
-function generateSystemHostname({ game, variant, vmid }) {
+function generateSystemHostname({ ctype, game, variant, vmid }) {
+  if (ctype === "dev") return `dev-${vmid}`;
+
   const g = (game || "").toLowerCase();
   const v = (variant || "").toLowerCase();
 
@@ -97,9 +107,9 @@ function generateAdminPassword() {
 }
 
 /* -------------------------------------------------------------
-   BUILD AGENT PAYLOAD
+   GAME PAYLOAD (UNCHANGED)
 ------------------------------------------------------------- */
-function buildAgentPayload({
+function buildGameAgentPayload({
   vmid,
   game,
   variant,
@@ -120,12 +130,11 @@ function buildAgentPayload({
   const ver = version || "1.20.1";
   const w = world || "world";
 
-  if (!v) throw new Error("variant is required (paper, forge, fabric, vanilla, purpur)");
+  if (!v) throw new Error("variant is required");
 
   let art = artifactPath;
   let jpath = javaPath;
 
-  // --------- VARIANT → ARTIFACT PATH ---------
   if (!art && g === "minecraft") {
     switch (v) {
       case "paper":
@@ -133,25 +142,20 @@ function buildAgentPayload({
       case "purpur":
         art = `minecraft/${v}/${ver}/server.jar`;
         break;
-
       case "forge":
         art = `minecraft/forge/${ver}/forge-installer.jar`;
         break;
-
       case "fabric":
         art = `minecraft/fabric/${ver}/fabric-server.jar`;
         break;
-
       case "neoforge":
         art = `minecraft/neoforge/${ver}/neoforge-installer.jar`;
         break;
-
       default:
         throw new Error(`Unsupported Minecraft variant: ${v}`);
     }
   }
 
-  // --------- JAVA RUNTIME SELECTOR ----------
   if (!jpath && g === "minecraft") {
     const javaVersion = pickJavaRuntimeForMc(ver);
     jpath =
@@ -160,17 +164,8 @@ function buildAgentPayload({
         : "java/17/OpenJDK17.tar.gz";
   }
 
-  // --------- MEMORY DEFAULTS ----------
   let mem = Number(memoryMiB) || 0;
   if (mem <= 0) mem = ["forge", "neoforge"].includes(v) ? 4096 : 2048;
-
-  // Steam + admin credentials (persisted, optional)
-  const resolvedSteamUser = steamUser || "anonymous";
-  const resolvedSteamPass = steamPass || "";
-  const resolvedSteamAuth = steamAuth || "";
-
-  const resolvedAdminUser = adminUser || "admin";
-  const resolvedAdminPass = adminPass || generateAdminPassword();
 
   return {
     vmid,
@@ -182,18 +177,32 @@ function buildAgentPayload({
     artifact_path: art,
     java_path: jpath,
     memory_mb: mem,
-
-    steam_user: resolvedSteamUser,
-    steam_pass: resolvedSteamPass,
-    steam_auth: resolvedSteamAuth,
-
-    admin_user: resolvedAdminUser,
-    admin_pass: resolvedAdminPass,
+    steam_user: steamUser || "anonymous",
+    steam_pass: steamPass || "",
+    steam_auth: steamAuth || "",
+    admin_user: adminUser || "admin",
+    admin_pass: adminPass || generateAdminPassword(),
   };
 }
 
 /* -------------------------------------------------------------
-   SEND CONFIG  → triggers async provision+start in agent
+   DEV PAYLOAD (NEW, MINIMAL, CANONICAL)
+------------------------------------------------------------- */
+function buildDevAgentPayload({ vmid, runtime, version, memoryMiB }) {
+  if (!runtime) throw new Error("runtime required for dev container");
+  if (!version) throw new Error("version required for dev container");
+
+  return {
+    vmid,
+    ctype: "dev",
+    runtime,
+    version,
+    memory_mb: Number(memoryMiB) || 2048,
+  };
+}
+
+/* -------------------------------------------------------------
+   SEND CONFIG
 ------------------------------------------------------------- */
 async function sendAgentConfig({ ip, payload }) {
   const url = `http://${ip}:${AGENT_PORT}/config`;
@@ -213,7 +222,7 @@ async function sendAgentConfig({ ip, payload }) {
 }
 
 /* -------------------------------------------------------------
-   WAIT FOR AGENT READY  (poll /status)
+   WAIT FOR AGENT READY
 ------------------------------------------------------------- */
 async function waitForAgentRunning({ ip, timeoutMs = 10 * 60_000 }) {
   const url = `http://${ip}:${AGENT_PORT}/status`;
@@ -221,230 +230,109 @@ async function waitForAgentRunning({ ip, timeoutMs = 10 * 60_000 }) {
   if (AGENT_TOKEN) headers["Authorization"] = `Bearer ${AGENT_TOKEN}`;
 
   const deadline = Date.now() + timeoutMs;
-  let last;
 
   while (Date.now() < deadline) {
     try {
       const resp = await fetch(url, { headers });
-      if (!resp.ok) {
-        last = new Error(`/status HTTP ${resp.status}`);
-      } else {
-        const data = await resp.json().catch(() => ({}));
-        const state = (data.state || data.status || "").toLowerCase();
-
-        // Agent's state machine:
-        // idle → installing → verifying → starting → running
-        if (state === "running") return { state: "running", raw: data };
-        if (state === "error" || state === "crashed") {
-          const msg = data.error || "";
-          throw new Error(`agent state=${state} ${msg ? `(${msg})` : ""}`);
-        }
-
-        last = new Error(`agent state=${state || "unknown"}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        const state = (data.state || "").toLowerCase();
+        if (state === "running") return data;
+        if (state === "error") throw new Error(data.error || "agent error");
       }
-    } catch (err) {
-      last = err;
-    }
-
+    } catch {}
     await sleep(3000);
   }
 
-  throw last || new Error("Agent did not reach running state");
+  throw new Error("Agent did not reach running state");
 }
 
 /* -------------------------------------------------------------
-   MAIN PROVISION ENTRYPOINT
+   MAIN ENTRYPOINT
 ------------------------------------------------------------- */
 export async function provisionAgentInstance(body = {}) {
-  const {
-    customerId,
-    game,
-    variant,
-    version,
-    world,
-    ctype: rawCtype,
-    name,
-    cpuCores,
-    memoryMiB,
-    diskGiB,
-    portsNeeded,
-    artifactPath,
-    javaPath,
+  const ctype = body.ctype || "game";
 
-    // NEW optional fields
-    steamUser,
-    steamPass,
-    steamAuth,
-    adminUser,
-    adminPass,
-  } = body;
-
-  if (!customerId) throw new Error("customerId required");
-  if (!game) throw new Error("game required");
-  if (!variant) throw new Error("variant required");
-
-  const ctype = rawCtype || "game";
-  const isMinecraft = game.toLowerCase().includes("minecraft");
+  const req =
+    ctype === "dev"
+      ? normalizeDevRequest(body)
+      : normalizeGameRequest(body);
 
   let vmid;
-  let allocatedPortsMap = null;
-  let gamePorts = [];
   let ctIp;
-  let instanceHostname;
 
   try {
-    console.log("[agentProvision] STEP 1: allocate VMID");
     vmid = await allocateVmid(ctype);
 
-    instanceHostname = generateSystemHostname({ game, variant, vmid });
-
-    console.log("[agentProvision] STEP 2: port allocation");
-    if (!isMinecraft && (portsNeeded ?? 0) > 0) {
-      gamePorts = await PortAllocationService.reserve({
-        vmid,
-        count: portsNeeded,
-        portType: "game",
-      });
-      allocatedPortsMap = { game: gamePorts };
-    } else {
-      gamePorts = [25565];
-      allocatedPortsMap = { game: gamePorts };
-    }
-
-    const node = process.env.PROXMOX_NODE || "zlh-prod1";
-    const bridge = ctype === "dev" ? "vmbr2" : "vmbr3";
-    const cpu = cpuCores ? Number(cpuCores) : 2;
-    const memory = memoryMiB ? Number(memoryMiB) : 2048;
-
-    const description = name
-      ? `${name} (customer=${customerId}; vmid=${vmid}; agent=v1)`
-      : `customer=${customerId}; vmid=${vmid}; agent=v1`;
-
-    const tags = [
-      `cust-${customerId}`,
-      `type-${ctype}`,
-      `game-${game}`,
-      variant ? `var-${variant}` : null,
-    ]
-      .filter(Boolean)
-      .join(",");
-
-    console.log(
-      `[agentProvision] STEP 3: clone template ${AGENT_TEMPLATE_VMID} → vmid=${vmid}`
-    );
+    const hostname = generateSystemHostname({
+      ctype,
+      game: req.game,
+      variant: req.variant,
+      vmid,
+    });
 
     await cloneContainer({
       templateVmid: AGENT_TEMPLATE_VMID,
       vmid,
-      name: instanceHostname,
+      name: hostname,
       full: 1,
     });
 
-    console.log("[agentProvision] STEP 4: configure CPU/mem/bridge/tags");
     await configureContainer({
       vmid,
-      cpu,
-      memory,
-      bridge,
-      description,
-      tags,
+      cpu: req.cpuCores || 2,
+      memory: req.memoryMiB || 2048,
+      bridge: ctype === "dev" ? "vmbr2" : "vmbr3",
     });
 
-    console.log("[agentProvision] STEP 5: start container");
     await startWithRetry(vmid);
 
-    console.log("[agentProvision] STEP 6: detect container IP");
-    const ip = await getCtIpWithRetry(vmid, node, 12, 10_000);
-    if (!ip) throw new Error("Failed to detect container IP");
-    ctIp = ip;
+    ctIp = await getCtIpWithRetry(vmid);
 
-    console.log(`[agentProvision] ctIp=${ctIp}`);
+    const payload =
+      ctype === "dev"
+        ? buildDevAgentPayload({
+            vmid,
+            runtime: body.runtime,
+            version: body.version,
+            memoryMiB: req.memoryMiB,
+          })
+        : buildGameAgentPayload({
+            vmid,
+            ...req,
+          });
 
-    console.log("[agentProvision] STEP 7: build agent payload");
-    const payload = buildAgentPayload({
-      vmid,
-      game,
-      variant,
-      version,
-      world,
-      ports: gamePorts,
-      artifactPath,
-      javaPath,
-      memoryMiB,
-
-      steamUser,
-      steamPass,
-      steamAuth,
-      adminUser,
-      adminPass,
-    });
-
-    console.log("[agentProvision] STEP 8: POST /config to agent (async provision+start)");
     await sendAgentConfig({ ip: ctIp, payload });
+    await waitForAgentRunning({ ip: ctIp });
 
-    console.log("[agentProvision] STEP 9: wait for agent to be running via /status");
-    const agentResult = await waitForAgentRunning({ ip: ctIp });
-
-    console.log("[agentProvision] STEP 10: DB save");
-    const instance = await prisma.containerInstance.create({
+    await prisma.containerInstance.create({
       data: {
         vmid,
-        customerId,
+        customerId: req.customerId,
         ctype,
-        hostname: instanceHostname,
+        hostname,
         ip: ctIp,
-        allocatedPorts: allocatedPortsMap,
         payload,
-        agentState: agentResult.state,
+        agentState: "running",
         agentLastSeen: new Date(),
       },
     });
 
-    console.log("[agentProvision] STEP 11: commit ports");
-    if (!isMinecraft && gamePorts.length) {
-      await PortAllocationService.commit({
-        vmid,
-        ports: gamePorts,
-        portType: "game",
-      });
-    }
-
-    console.log("[agentProvision] STEP 12: publish edge");
     await enqueuePublishEdge({
       vmid,
-      slotHostname: instanceHostname,
-      instanceHostname,
-      ports: gamePorts,
+      instanceHostname: hostname,
       ctIp,
-      game,
+      game: req.game,
     });
 
     await confirmVmidAllocated(vmid);
 
-    console.log("[agentProvision] COMPLETE");
-
-    return {
-      vmid,
-      ip: ctIp,
-      hostname: instanceHostname,
-      ports: gamePorts,
-      instance,
-    };
+    return { vmid, hostname, ip: ctIp };
   } catch (err) {
-    console.error("[agentProvision] ERROR:", err.message);
-
-    try {
-      if (vmid) await PortAllocationService.releaseByVmid(vmid);
-    } catch {}
-
-    try {
-      if (vmid) await deleteContainer(vmid);
-    } catch {}
-
-    try {
-      if (vmid) await releaseVmid(vmid);
-    } catch {}
-
+    if (vmid) {
+      try { await deleteContainer(vmid); } catch {}
+      try { await releaseVmid(vmid); } catch {}
+    }
     throw err;
   }
 }
