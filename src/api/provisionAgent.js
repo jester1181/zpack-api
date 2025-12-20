@@ -2,10 +2,11 @@
 // FINAL AGENT-DRIVEN PROVISIONING PIPELINE
 // Supports: paper, vanilla, purpur, forge, fabric, neoforge + dev containers
 //
-// Phase 12-14-25:
-// - Orchestrator remains unified
-// - Game/Dev validation split
-// - Dev containers provision like game infra, diverge at runtime semantics
+// Updated (Dec 2025):
+// - Keep V3 hostname behavior (FQDN: mc-vanilla-5072.zerolaghub.quest)
+// - Decouple edge publishing from PortPool allocation
+// - Minecraft does NOT allocate PortPool ports, but still publishes edge using routing port 25565
+// - Preserve game/dev validation split (normalizeGameRequest / normalizeDevRequest)
 
 import "dotenv/config";
 import fetch from "node-fetch";
@@ -43,6 +44,9 @@ const AGENT_TEMPLATE_VMID = Number(
 
 const AGENT_PORT = Number(process.env.ZLH_AGENT_PORT || 18888);
 const AGENT_TOKEN = process.env.ZLH_AGENT_TOKEN || null;
+
+// V3 behavior: slotHostname is FQDN built here
+const ZONE = process.env.TECHNITIUM_ZONE || "zerolaghub.quest";
 
 /* -------------------------------------------------------------
    VERSION PARSER (Minecraft only)
@@ -92,8 +96,11 @@ function generateSystemHostname({ ctype, game, variant, vmid }) {
 
   let varPart = "";
   if (g.includes("minecraft")) {
-    if (["paper", "forge", "fabric", "vanilla", "purpur", "neoforge"].includes(v))
+    if (
+      ["paper", "forge", "fabric", "vanilla", "purpur", "neoforge"].includes(v)
+    ) {
       varPart = v;
+    }
   }
 
   return varPart ? `${prefix}-${varPart}-${vmid}` : `${prefix}-${vmid}`;
@@ -107,7 +114,7 @@ function generateAdminPassword() {
 }
 
 /* -------------------------------------------------------------
-   GAME PAYLOAD (UNCHANGED)
+   GAME PAYLOAD
 ------------------------------------------------------------- */
 function buildGameAgentPayload({
   vmid,
@@ -186,9 +193,9 @@ function buildGameAgentPayload({
 }
 
 /* -------------------------------------------------------------
-   DEV PAYLOAD (NEW, MINIMAL, CANONICAL)
+   DEV PAYLOAD
 ------------------------------------------------------------- */
-function buildDevAgentPayload({ vmid, runtime, version, memoryMiB }) {
+function buildDevAgentPayload({ vmid, runtime, version, memoryMiB, ports }) {
   if (!runtime) throw new Error("runtime required for dev container");
   if (!version) throw new Error("version required for dev container");
 
@@ -198,6 +205,7 @@ function buildDevAgentPayload({ vmid, runtime, version, memoryMiB }) {
     runtime,
     version,
     memory_mb: Number(memoryMiB) || 2048,
+    ports: Array.isArray(ports) ? ports : [ports].filter(Boolean),
   };
 }
 
@@ -230,6 +238,7 @@ async function waitForAgentRunning({ ip, timeoutMs = 10 * 60_000 }) {
   if (AGENT_TOKEN) headers["Authorization"] = `Bearer ${AGENT_TOKEN}`;
 
   const deadline = Date.now() + timeoutMs;
+  let lastLoggedStep = null;
 
   while (Date.now() < deadline) {
     try {
@@ -237,10 +246,33 @@ async function waitForAgentRunning({ ip, timeoutMs = 10 * 60_000 }) {
       if (resp.ok) {
         const data = await resp.json();
         const state = (data.state || "").toLowerCase();
-        if (state === "running") return data;
-        if (state === "error") throw new Error(data.error || "agent error");
+        const step = data.installStep || data.currentStep || "unknown";
+        const progress = data.progress || "";
+
+        if (step !== lastLoggedStep) {
+          console.log(`[AGENT ${ip}] state=${state} step=${step} ${progress}`);
+          lastLoggedStep = step;
+        }
+
+        if (state === "running") {
+          console.log(`[AGENT ${ip}] ✓ Provisioning complete`);
+          return data;
+        }
+
+        if (state === "error") {
+          const errorMsg = data.error || "agent error";
+          console.error(`[AGENT ${ip}] ✗ ERROR:`, errorMsg);
+          throw new Error(errorMsg);
+        }
       }
-    } catch {}
+    } catch (err) {
+      if (
+        !err.message.includes("ECONNREFUSED") &&
+        !err.message.includes("fetch failed")
+      ) {
+        console.error(`[AGENT ${ip}] Poll error:`, err.message);
+      }
+    }
     await sleep(3000);
   }
 
@@ -252,17 +284,47 @@ async function waitForAgentRunning({ ip, timeoutMs = 10 * 60_000 }) {
 ------------------------------------------------------------- */
 export async function provisionAgentInstance(body = {}) {
   const ctype = body.ctype || "game";
+  console.log(`[agentProvision] STEP 0: Starting ${ctype} container provisioning`);
 
   const req =
-    ctype === "dev"
-      ? normalizeDevRequest(body)
-      : normalizeGameRequest(body);
+    ctype === "dev" ? normalizeDevRequest(body) : normalizeGameRequest(body);
+
+  const gameLower = String(req.game || "").toLowerCase();
+  const isMinecraft = ctype === "game" && gameLower.includes("minecraft");
 
   let vmid;
   let ctIp;
+  let allocatedPorts = [];
+  let txnId = null;
 
   try {
+    console.log("[agentProvision] STEP 1: allocate VMID");
     vmid = await allocateVmid(ctype);
+    console.log(`[agentProvision] → Allocated vmid=${vmid}`);
+
+    // Allocate ports if needed (Minecraft skips PortPool; uses 25565 via Velocity)
+    if (!isMinecraft && req.portsNeeded && req.portsNeeded > 0) {
+      console.log("[agentProvision] STEP 2: port allocation");
+      txnId = crypto.randomUUID();
+
+      const portObjs = await PortAllocationService.reserve({
+        game: req.game,
+        variant: req.variant,
+        customerId: req.customerId,
+        vmid,
+        purpose: ctype === "game" ? "game_main" : "dev",
+        txnId,
+        count: req.portsNeeded,
+      });
+
+      allocatedPorts = Array.isArray(portObjs)
+        ? portObjs.map((p) => (typeof p === "object" ? p.port : p))
+        : [portObjs];
+
+      console.log(`[agentProvision] → Allocated ports: ${allocatedPorts.join(", ")}`);
+    } else {
+      console.log("[agentProvision] STEP 2: port allocation (skipped)");
+    }
 
     const hostname = generateSystemHostname({
       ctype,
@@ -271,6 +333,12 @@ export async function provisionAgentInstance(body = {}) {
       vmid,
     });
 
+    // V3 correct behavior: build FQDN here
+    const slotHostname = `${hostname}.${ZONE}`;
+
+    console.log(
+      `[agentProvision] STEP 3: clone template ${AGENT_TEMPLATE_VMID} → vmid=${vmid}`
+    );
     await cloneContainer({
       templateVmid: AGENT_TEMPLATE_VMID,
       vmid,
@@ -278,6 +346,7 @@ export async function provisionAgentInstance(body = {}) {
       full: 1,
     });
 
+    console.log("[agentProvision] STEP 4: configure CPU/mem/bridge/tags");
     await configureContainer({
       vmid,
       cpu: req.cpuCores || 2,
@@ -285,10 +354,14 @@ export async function provisionAgentInstance(body = {}) {
       bridge: ctype === "dev" ? "vmbr2" : "vmbr3",
     });
 
+    console.log("[agentProvision] STEP 5: start container");
     await startWithRetry(vmid);
 
+    console.log("[agentProvision] STEP 6: detect container IP");
     ctIp = await getCtIpWithRetry(vmid);
+    console.log(`[agentProvision] → ctIp=${ctIp}`);
 
+    console.log("[agentProvision] STEP 7: build agent payload");
     const payload =
       ctype === "dev"
         ? buildDevAgentPayload({
@@ -296,15 +369,22 @@ export async function provisionAgentInstance(body = {}) {
             runtime: body.runtime,
             version: body.version,
             memoryMiB: req.memoryMiB,
+            ports: allocatedPorts,
           })
         : buildGameAgentPayload({
             vmid,
             ...req,
+            // agent can still use ports; for minecraft, provide 25565 semantic port
+            ports: allocatedPorts.length > 0 ? allocatedPorts : isMinecraft ? [25565] : [],
           });
 
+    console.log("[agentProvision] STEP 8: POST /config to agent (async provision+start)");
     await sendAgentConfig({ ip: ctIp, payload });
+
+    console.log("[agentProvision] STEP 9: wait for agent to be running via /status");
     await waitForAgentRunning({ ip: ctIp });
 
+    console.log("[agentProvision] STEP 10: DB save");
     await prisma.containerInstance.create({
       data: {
         vmid,
@@ -312,27 +392,67 @@ export async function provisionAgentInstance(body = {}) {
         ctype,
         hostname,
         ip: ctIp,
+        allocatedPorts, // matches schema
         payload,
         agentState: "running",
         agentLastSeen: new Date(),
       },
     });
 
-    await enqueuePublishEdge({
-      vmid,
-      instanceHostname: hostname,
-      ctIp,
-      game: req.game,
-    });
+    // STEP 11: commit ports ONLY if allocated from PortPool
+    if (allocatedPorts.length > 0) {
+      console.log("[agentProvision] STEP 11: commit ports");
+      await PortAllocationService.commit({ vmid, ports: allocatedPorts });
+    } else {
+      console.log("[agentProvision] STEP 11: commit ports (skipped - none allocated)");
+    }
+
+    // STEP 12: publish edge for ALL game servers (Minecraft included)
+    if (ctype === "game") {
+      console.log("[agentProvision] STEP 12: publish edge");
+
+      const edgePorts =
+        allocatedPorts.length > 0 ? allocatedPorts : isMinecraft ? [25565] : [];
+
+      await enqueuePublishEdge({
+        vmid,
+        slotHostname, // FQDN (V3 behavior)
+        instanceHostname: hostname, // short (optional, kept for compatibility)
+        ports: edgePorts,
+        ctIp,
+        game: req.game,
+        txnId,
+      });
+    } else {
+      console.log("[agentProvision] STEP 12: publish edge (skipped - dev container)");
+    }
 
     await confirmVmidAllocated(vmid);
 
-    return { vmid, hostname, ip: ctIp };
+    console.log("[agentProvision] COMPLETE: success");
+    return { vmid, hostname, ip: ctIp, ports: allocatedPorts };
   } catch (err) {
-    if (vmid) {
-      try { await deleteContainer(vmid); } catch {}
-      try { await releaseVmid(vmid); } catch {}
+    console.error("[agentProvision] ERROR:", err.message);
+
+    // Rollback ports on failure
+    if (vmid && allocatedPorts.length > 0) {
+      try {
+        await PortAllocationService.releaseByVmid(vmid);
+        console.log(`[agentProvision] → Rolled back ports for vmid=${vmid}`);
+      } catch (rollbackErr) {
+        console.error("[agentProvision] → Port rollback failed:", rollbackErr.message);
+      }
     }
+
+    if (vmid) {
+      try {
+        await deleteContainer(vmid);
+      } catch {}
+      try {
+        await releaseVmid(vmid);
+      } catch {}
+    }
+
     throw err;
   }
 }

@@ -1,5 +1,5 @@
 // src/api/provisionDev.js
-// DEV-SIDE request normalization + validation (payload not implemented yet)
+// DEV-SIDE request normalization + validation
 
 export function normalizeDevRequest(body = {}) {
   const {
@@ -10,16 +10,24 @@ export function normalizeDevRequest(body = {}) {
     diskGiB,
     portsNeeded,
 
-    // dev-specific fields (future)
+    // dev fields
     runtime,
+
+    // canonical runtime version field for dev (matches your curl)
+    version,
+
+    // legacy/alternate naming (optional)
     runtimeVersion,
+
+    // optional addons
     addons,
   } = body;
 
   if (!customerId) throw new Error("customerId required");
+  if (!runtime) throw new Error("runtime required");
+  const resolvedVersion = version || runtimeVersion;
+  if (!resolvedVersion) throw new Error("version required");
 
-  // NOTE: Do NOT require game/variant/world for dev.
-  // Payload work is explicitly deferred per instruction.
   return {
     customerId,
     name,
@@ -27,9 +35,11 @@ export function normalizeDevRequest(body = {}) {
     memoryMiB,
     diskGiB,
     portsNeeded,
+
     runtime,
-    runtimeVersion,
-    addons,
+    version: String(resolvedVersion),
+
+    addons: Array.isArray(addons) ? addons : undefined,
   };
 }
 
