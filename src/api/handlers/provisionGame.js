@@ -1,60 +1,22 @@
-// src/api/provisionGame.js
-// GAME-SIDE request normalization + validation (no payload changes yet)
+// src/api/handlers/provisionGame.js
 
 export function normalizeGameRequest(body = {}) {
-  const {
-    customerId,
-    game,
-    variant,
-    version,
-    world,
-    name,
-    cpuCores,
-    memoryMiB,
-    diskGiB,
-    portsNeeded,
-    artifactPath,
-    javaPath,
+  if (!body.game) {
+    throw new Error("game is required");
+  }
 
-    // passthrough creds (kept here just for shaping; payload stays in provisionAgent.js for now)
-    steamUser,
-    steamPass,
-    steamAuth,
-    adminUser,
-    adminPass,
-  } = body;
-
-  if (!customerId) throw new Error("customerId required");
-  if (!game) throw new Error("game required");
-  if (!variant) throw new Error("variant required");
-
-  const gameLower = String(game).toLowerCase();
-  const isMinecraft = gameLower.includes("minecraft");
+  if (!body.variant) {
+    throw new Error("variant is required");
+  }
 
   return {
-    customerId,
-    game,
-    variant,
-    version,
-    world,
-
-    name,
-    cpuCores,
-    memoryMiB,
-    diskGiB,
-    portsNeeded,
-
-    artifactPath,
-    javaPath,
-
-    steamUser,
-    steamPass,
-    steamAuth,
-    adminUser,
-    adminPass,
-
-    isMinecraft,
+    customerId: body.customerId,
+    game: body.game,
+    variant: body.variant,
+    version: body.version,
+    world: body.world || "world",
+    memoryMiB: body.memoryMiB || 2048,
+    cpuCores: body.cpuCores || 2,
+    portsNeeded: body.portsNeeded || 0,
   };
 }
-
-export default { normalizeGameRequest };

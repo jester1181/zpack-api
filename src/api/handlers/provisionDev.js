@@ -1,46 +1,20 @@
-// src/api/provisionDev.js
-// DEV-SIDE request normalization + validation
+// src/api/handlers/provisionDev.js
 
 export function normalizeDevRequest(body = {}) {
-  const {
-    customerId,
-    name,
-    cpuCores,
-    memoryMiB,
-    diskGiB,
-    portsNeeded,
+  if (!body.runtime) {
+    throw new Error("runtime is required for dev container");
+  }
 
-    // dev fields
-    runtime,
-
-    // canonical runtime version field for dev (matches your curl)
-    version,
-
-    // legacy/alternate naming (optional)
-    runtimeVersion,
-
-    // optional addons
-    addons,
-  } = body;
-
-  if (!customerId) throw new Error("customerId required");
-  if (!runtime) throw new Error("runtime required");
-  const resolvedVersion = version || runtimeVersion;
-  if (!resolvedVersion) throw new Error("version required");
+  if (!body.version) {
+    throw new Error("version is required for dev container");
+  }
 
   return {
-    customerId,
-    name,
-    cpuCores,
-    memoryMiB,
-    diskGiB,
-    portsNeeded,
-
-    runtime,
-    version: String(resolvedVersion),
-
-    addons: Array.isArray(addons) ? addons : undefined,
+    customerId: body.customerId,
+    runtime: body.runtime,
+    version: body.version,
+    memoryMiB: body.memoryMiB || 2048,
+    cpuCores: body.cpuCores || 2,
+    portsNeeded: body.portsNeeded || 0,
   };
 }
-
-export default { normalizeDevRequest };
