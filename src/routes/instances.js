@@ -1,35 +1,35 @@
 // src/routes/instances.js
 import express from 'express';
+import prisma from '../services/prisma.js';
 import { provisionAgentInstance } from '../api/provisionAgent.js';
 
 const router = express.Router();
 
 /**
+ * GET /api/instances
+ * List all instances (no auth yet)
+ */
+router.get('/', async (req, res, next) => {
+  try {
+    const rows = await prisma.containerInstance.findMany({
+      orderBy: { createdAt: 'desc' }
+    });
+    res.json({ ok: true, rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * POST /api/instances
- *
- * Body (v1, agent-driven):
- *   {
- *     customerId: "u001",
- *     game: "minecraft",
- *     variant: "paper",
- *     version: "1.20.1",
- *     world: "world",
- *     ctype: "game",       // or "dev"
- *     name: "my-first-server",
- *     cpuCores: 2,
- *     memoryMiB: 2048,
- *     diskGiB: 10,
- *     portsNeeded: 0,      // non-MC games only
- *     artifactPath: "...", // optional
- *     javaPath: "..."      // optional
- *   }
+ * Provision a new instance (agent-driven)
  */
 router.post('/', async (req, res, next) => {
   try {
     const result = await provisionAgentInstance(req.body);
-    return res.json({ ok: true, ...result });
+    res.json({ ok: true, ...result });
   } catch (err) {
-    return next(err);
+    next(err);
   }
 });
 

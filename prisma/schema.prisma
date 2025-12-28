@@ -139,10 +139,18 @@ model AuditLog {
   createdAt DateTime @default(now())
 }
 
-model Customer {
-  id        String   @id
-  email     String?
-  name      String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+model User {
+  id           String   @id @default(cuid())
+
+  email        String   @unique
+  username     String   @unique
+  passwordHash String
+
+  firstName    String?
+  lastName     String?
+  displayName String?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 }
+
