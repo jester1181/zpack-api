@@ -1,7 +1,17 @@
-import dotenv from 'dotenv';
-dotenv.config();
+/* ======================================================
+   REDIS CLIENT
+   ====================================================== */
 
-export const redisOptions = {
-  host: process.env.REDIS_HOST || '127.0.0.1',
-  port: parseInt(process.env.REDIS_PORT || '6379', 10)
-};
+import { createClient } from "redis";
+
+export const redis = createClient({
+  url: process.env.REDIS_URL || "redis://127.0.0.1:6379",
+});
+
+redis.on("error", (err) => {
+  console.error("[redis] error", err);
+});
+
+await redis.connect();
+
+export default redis;

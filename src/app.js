@@ -14,12 +14,22 @@ import edgeRoutes from "./routes/edge.js";
 import debugRoutes from "./routes/debug.js";
 import authRoutes from "./routes/auth.js";
 import edgeTest from "./routes/edge.test.js";
+import serversRouter from "./routes/servers.js";
+import { startAgentPoller } from "./utils/agentPoller.js";
+import catalogRoutes from "./routes/catalog.js";
 
 /* ======================================================
    APP INIT
    ====================================================== */
 
 const app = express();
+
+/* ======================================================
+   START BACKGROUND SERVICES
+   ====================================================== */
+
+startAgentPoller();
+
 
 /* ======================================================
    BODY PARSING  ✅ MUST COME BEFORE ROUTES
@@ -50,7 +60,7 @@ app.use(
       console.warn("[CORS] Blocked origin:", origin);
       return callback(new Error("Not allowed by CORS"));
     },
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: false,
   })
@@ -76,8 +86,11 @@ app.use("/api/v2/ports", portRoutes);
 app.use("/api/containers", containers);
 app.use("/api/instances", instances);
 app.use("/api/templates", templatesRouter);
+app.use("/api/catalog", catalogRoutes);
 app.use("/api/proxmox", proxRoute);
 app.use("/api/edge", edgeRoutes);
+app.use("/api/servers", serversRouter);
+
 
 // Prometheus
 app.use("/sd", promSd);

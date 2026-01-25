@@ -12,6 +12,8 @@ export function signToken(user) {
     {
       sub: user.id,
       email: user.email,
+      username: user.username,
+      displayName: user.displayName ?? user.username,
       scopes: ["*"], // tighten later
     },
     SECRET,
